@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY mcp_server.py .
 
 ENV PORT=8000
+ENV AUTH_SERVICE_URL=https://mytestauth.onrender.com
 ENV TEST_MODE=true
 
 EXPOSE 8000
