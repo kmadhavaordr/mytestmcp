@@ -13,7 +13,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY mcp_server.py .
-COPY tenants.yaml .
 
 # Environment variables (can be overridden at runtime)
 ENV MCP_PORT=8000
