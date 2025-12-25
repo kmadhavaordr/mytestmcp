@@ -1,27 +1,22 @@
 """
 Ordr MCP Server
 
-MCP Server that:
-1. Receives requests from Copilot Studio (with JWT token)
-2. Calls Auth service to validate token and get customer info
-3. Returns customer-specific data
+MCP Server that returns customer-specific data.
+For now uses TEST_MODE with default customer.
+Auth integration will be added once we confirm basic flow works.
 
 Environment Variables:
 - PORT: Port to run on (default: 8000)
-- AUTH_SERVICE_URL: URL of auth validator service
-- TEST_MODE: "true" to skip auth and use defaults
+- AUTH_SERVICE_URL: URL of auth validator service (for future use)
+- TEST_MODE: "true" to use default customer
 """
 
 import os
 import logging
 from datetime import datetime
 from typing import Optional
-from contextlib import asynccontextmanager
 
-import httpx
 from fastmcp import FastMCP
-from starlette.requests import Request
-from starlette.middleware.base import BaseHTTPMiddleware
 
 # Configure logging
 logging.basicConfig(
@@ -37,79 +32,10 @@ logger = logging.getLogger("ordr-mcp")
 AUTH_SERVICE_URL = os.environ.get("AUTH_SERVICE_URL", "https://ordr-auth.onrender.com")
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 
-# Defaults for test mode
+# Defaults
 DEFAULT_DATA_SET = "tenant-a"
-DEFAULT_CUSTOMER_ID = "test-customer"
-DEFAULT_CUSTOMER_NAME = "Test Customer (TEST_MODE)"
+DEFAULT_CUSTOMER_NAME = "Healthcare Corp"
 DEFAULT_USER_EMAIL = "testuser@example.com"
-
-# =============================================================================
-# REQUEST CONTEXT (per-request customer info)
-# =============================================================================
-
-_request_context = {}
-
-def set_context(data_set: str, customer_id: str, customer_name: str, user_email: str):
-    """Set context for current request."""
-    global _request_context
-    _request_context = {
-        "data_set": data_set,
-        "customer_id": customer_id,
-        "customer_name": customer_name,
-        "user_email": user_email
-    }
-
-def get_context() -> dict:
-    """Get context for current request."""
-    if not _request_context:
-        if TEST_MODE:
-            return {
-                "data_set": DEFAULT_DATA_SET,
-                "customer_id": DEFAULT_CUSTOMER_ID,
-                "customer_name": DEFAULT_CUSTOMER_NAME,
-                "user_email": DEFAULT_USER_EMAIL
-            }
-        raise ValueError("No context set - auth may have failed")
-    return _request_context.copy()
-
-# =============================================================================
-# AUTH SERVICE CLIENT
-# =============================================================================
-
-async def validate_token_with_auth_service(authorization: str) -> dict:
-    """
-    Call Auth service to validate token and get customer info.
-    
-    Returns: {"customer_id", "customer_name", "data_set", "user_email"}
-    Raises: ValueError if validation fails
-    """
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            response = await client.get(
-                f"{AUTH_SERVICE_URL}/auth",
-                headers={"Authorization": authorization}
-            )
-            
-            if response.status_code == 401:
-                raise ValueError("Invalid or expired token")
-            
-            if response.status_code == 403:
-                raise ValueError("User not authorized for any customer")
-            
-            if response.status_code != 200:
-                raise ValueError(f"Auth service error: {response.status_code}")
-            
-            # Extract customer info from response headers
-            return {
-                "customer_id": response.headers.get("X-Customer-Id", "unknown"),
-                "customer_name": response.headers.get("X-Customer-Name", "Unknown"),
-                "data_set": response.headers.get("X-Data-Set", "tenant-a"),
-                "user_email": response.headers.get("X-User-Email", "unknown"),
-            }
-            
-        except httpx.RequestError as e:
-            logger.error(f"Failed to reach auth service: {e}")
-            raise ValueError(f"Auth service unavailable")
 
 # =============================================================================
 # MOCK DATA
@@ -249,13 +175,25 @@ MOCK_ALERTS = {
     ]
 }
 
+
+def get_context() -> dict:
+    """Get current customer context. For now returns defaults."""
+    return {
+        "data_set": DEFAULT_DATA_SET,
+        "customer_name": DEFAULT_CUSTOMER_NAME,
+        "user_email": DEFAULT_USER_EMAIL
+    }
+
+
 def get_devices() -> list:
     ctx = get_context()
     return MOCK_DEVICES.get(ctx["data_set"], [])
 
+
 def get_alerts() -> list:
     ctx = get_context()
     return MOCK_ALERTS.get(ctx["data_set"], [])
+
 
 # =============================================================================
 # FASTMCP SERVER
@@ -277,58 +215,6 @@ mcp = FastMCP(
     - whoami: Show current user and customer context
     """
 )
-
-# =============================================================================
-# AUTH MIDDLEWARE
-# =============================================================================
-
-class AuthMiddleware(BaseHTTPMiddleware):
-    """Middleware to validate token and set customer context."""
-    
-    async def dispatch(self, request: Request, call_next):
-        # Skip auth for health checks
-        if request.url.path in ["/health", "/", "/docs", "/openapi.json"]:
-            return await call_next(request)
-        
-        authorization = request.headers.get("Authorization")
-        
-        if TEST_MODE and not authorization:
-            # Test mode without token - use defaults
-            logger.warning("TEST_MODE: No auth token, using default customer")
-            set_context(DEFAULT_DATA_SET, DEFAULT_CUSTOMER_ID, DEFAULT_CUSTOMER_NAME, DEFAULT_USER_EMAIL)
-        elif authorization:
-            # Validate with auth service
-            try:
-                customer_info = await validate_token_with_auth_service(authorization)
-                set_context(
-                    customer_info["data_set"],
-                    customer_info["customer_id"],
-                    customer_info["customer_name"],
-                    customer_info["user_email"]
-                )
-                logger.info(f"Auth OK: {customer_info['user_email']} → {customer_info['customer_name']}")
-            except ValueError as e:
-                logger.warning(f"Auth failed: {e}")
-                if not TEST_MODE:
-                    from starlette.responses import JSONResponse
-                    return JSONResponse(
-                        status_code=401,
-                        content={"error": "Authentication failed", "detail": str(e)}
-                    )
-                # In test mode, fall back to defaults
-                set_context(DEFAULT_DATA_SET, DEFAULT_CUSTOMER_ID, DEFAULT_CUSTOMER_NAME, DEFAULT_USER_EMAIL)
-        elif not TEST_MODE:
-            from starlette.responses import JSONResponse
-            return JSONResponse(
-                status_code=401,
-                content={"error": "No Authorization header"}
-            )
-        
-        response = await call_next(request)
-        return response
-
-# Add middleware
-mcp._app.add_middleware(AuthMiddleware)
 
 # =============================================================================
 # MCP TOOLS
@@ -360,7 +246,6 @@ def list_devices(
     
     return {
         "customer": ctx["customer_name"],
-        "user": ctx["user_email"],
         "total_count": len(devices),
         "devices": devices
     }
@@ -417,7 +302,6 @@ def list_alerts(
     
     return {
         "customer": ctx["customer_name"],
-        "user": ctx["user_email"],
         "total_count": len(alerts),
         "by_severity": severity_counts,
         "alerts": alerts
@@ -469,7 +353,6 @@ def get_network_summary() -> dict:
     
     return {
         "customer": ctx["customer_name"],
-        "user": ctx["user_email"],
         "summary": {
             "total_devices": len(devices),
             "device_types": device_types,
@@ -488,11 +371,11 @@ def whoami() -> dict:
     """Show current user and customer context (useful for testing)."""
     ctx = get_context()
     return {
-        "user_email": ctx["user_email"],
-        "customer_id": ctx["customer_id"],
         "customer_name": ctx["customer_name"],
         "data_set": ctx["data_set"],
-        "message": f"You are {ctx['user_email']} accessing {ctx['customer_name']}'s data"
+        "test_mode": TEST_MODE,
+        "auth_service_url": AUTH_SERVICE_URL,
+        "message": f"Currently serving {ctx['customer_name']}'s data (tenant-a)"
     }
 
 
