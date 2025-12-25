@@ -1,0 +1,10 @@
+# MCP Server
+fastmcp>=0.1.0
+
+# Auth Validator
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pyjwt>=2.8.0
+cryptography>=42.0.0
+httpx>=0.26.0
+pyyaml>=6.0.0
