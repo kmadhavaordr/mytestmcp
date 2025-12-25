@@ -1,2 +1,5 @@
-# Ordr MCP Server
+# Ordr MCP Server with Auth Gateway
 fastmcp>=2.0.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+httpx>=0.26.0
