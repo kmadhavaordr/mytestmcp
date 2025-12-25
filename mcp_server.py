@@ -537,9 +537,9 @@ if __name__ == "__main__":
     if TEST_MODE:
         logger.warning("⚠️  TEST MODE ENABLED - Authentication is disabled!")
     
-    # Run the server with SSE transport
+    # Run the server with streamable-http transport (for Copilot Studio compatibility)
     mcp.run(
-        transport="sse",
+        transport="streamable-http",
         host="0.0.0.0",
         port=port
     )
