@@ -1,22 +1,25 @@
 """
-Ordr MCP Server
+Ordr MCP Server - With Auth Service Integration
 
-MCP Server that returns customer-specific data.
-For now uses TEST_MODE with default customer.
-Auth integration will be added once we confirm basic flow works.
+This MCP server:
+1. Receives requests from Copilot Studio (with JWT token)
+2. Calls Auth service to validate token and get customer info
+3. Returns customer-specific data
 
 Environment Variables:
 - PORT: Port to run on (default: 8000)
-- AUTH_SERVICE_URL: URL of auth validator service (for future use)
-- TEST_MODE: "true" to use default customer
+- AUTH_SERVICE_URL: URL of auth validator service
+- TEST_MODE: "true" to use default customer when auth fails
 """
 
 import os
 import logging
 from datetime import datetime
 from typing import Optional
+from contextvars import ContextVar
 
-from fastmcp import FastMCP
+import httpx
+from fastmcp import FastMCP, Context
 
 # Configure logging
 logging.basicConfig(
@@ -29,13 +32,62 @@ logger = logging.getLogger("ordr-mcp")
 # CONFIGURATION
 # =============================================================================
 
-AUTH_SERVICE_URL = os.environ.get("AUTH_SERVICE_URL", "https://ordr-auth.onrender.com")
+AUTH_SERVICE_URL = os.environ.get("AUTH_SERVICE_URL", "https://mytestauth.onrender.com")
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
+
+# Context variable to store customer info per-request
+current_customer: ContextVar[dict] = ContextVar('current_customer', default=None)
 
 # Defaults
 DEFAULT_DATA_SET = "tenant-a"
 DEFAULT_CUSTOMER_NAME = "Healthcare Corp"
-DEFAULT_USER_EMAIL = "testuser@example.com"
+DEFAULT_USER_EMAIL = "default@example.com"
+
+# =============================================================================
+# AUTH SERVICE CLIENT
+# =============================================================================
+
+async def validate_with_auth_service(token: str) -> dict:
+    """
+    Call auth service to validate token.
+    
+    Returns: {"customer_name", "data_set", "user_email"}
+    Raises: Exception if validation fails
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.get(
+                f"{AUTH_SERVICE_URL}/auth",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            
+            if response.status_code == 401:
+                raise ValueError("Invalid or expired token")
+            if response.status_code == 403:
+                raise ValueError("User not authorized")
+            if response.status_code != 200:
+                raise ValueError(f"Auth error: {response.status_code}")
+            
+            # Get customer info from response headers
+            return {
+                "customer_name": response.headers.get("X-Customer-Name", "Unknown"),
+                "data_set": response.headers.get("X-Data-Set", "tenant-a"),
+                "user_email": response.headers.get("X-User-Email", "unknown"),
+                "customer_id": response.headers.get("X-Customer-Id", "unknown"),
+            }
+        except httpx.RequestError as e:
+            raise ValueError(f"Auth service unreachable: {e}")
+
+
+def get_default_customer() -> dict:
+    """Return default customer for TEST_MODE."""
+    return {
+        "customer_name": DEFAULT_CUSTOMER_NAME,
+        "data_set": DEFAULT_DATA_SET,
+        "user_email": DEFAULT_USER_EMAIL,
+        "customer_id": "default"
+    }
+
 
 # =============================================================================
 # MOCK DATA
@@ -176,22 +228,21 @@ MOCK_ALERTS = {
 }
 
 
-def get_context() -> dict:
-    """Get current customer context. For now returns defaults."""
-    return {
-        "data_set": DEFAULT_DATA_SET,
-        "customer_name": DEFAULT_CUSTOMER_NAME,
-        "user_email": DEFAULT_USER_EMAIL
-    }
+def get_customer_context() -> dict:
+    """Get current customer context, or default if not set."""
+    ctx = current_customer.get()
+    if ctx:
+        return ctx
+    return get_default_customer()
 
 
 def get_devices() -> list:
-    ctx = get_context()
+    ctx = get_customer_context()
     return MOCK_DEVICES.get(ctx["data_set"], [])
 
 
 def get_alerts() -> list:
-    ctx = get_context()
+    ctx = get_customer_context()
     return MOCK_ALERTS.get(ctx["data_set"], [])
 
 
@@ -234,7 +285,7 @@ def list_devices(
         min_risk_score: Only show devices with risk score >= this value
         location: Filter by location (partial match)
     """
-    ctx = get_context()
+    ctx = get_customer_context()
     devices = get_devices()
     
     if device_type:
@@ -246,6 +297,7 @@ def list_devices(
     
     return {
         "customer": ctx["customer_name"],
+        "user": ctx["user_email"],
         "total_count": len(devices),
         "devices": devices
     }
@@ -254,7 +306,7 @@ def list_devices(
 @mcp.tool()
 def get_device_by_ip(ip_address: str) -> dict:
     """Get device details by IP address."""
-    ctx = get_context()
+    ctx = get_customer_context()
     for device in get_devices():
         if device["ip_address"] == ip_address:
             return {"found": True, "customer": ctx["customer_name"], "device": device}
@@ -264,7 +316,7 @@ def get_device_by_ip(ip_address: str) -> dict:
 @mcp.tool()
 def get_device_by_hostname(hostname: str) -> dict:
     """Get device details by hostname (case-insensitive)."""
-    ctx = get_context()
+    ctx = get_customer_context()
     for device in get_devices():
         if device["hostname"].lower() == hostname.lower():
             return {"found": True, "customer": ctx["customer_name"], "device": device}
@@ -285,7 +337,7 @@ def list_alerts(
         status: Filter by status (open, investigating, resolved)
         device_hostname: Filter by device hostname
     """
-    ctx = get_context()
+    ctx = get_customer_context()
     alerts = get_alerts()
     
     if severity:
@@ -302,6 +354,7 @@ def list_alerts(
     
     return {
         "customer": ctx["customer_name"],
+        "user": ctx["user_email"],
         "total_count": len(alerts),
         "by_severity": severity_counts,
         "alerts": alerts
@@ -311,7 +364,7 @@ def list_alerts(
 @mcp.tool()
 def get_high_risk_devices(threshold: int = 70) -> dict:
     """Get devices with risk score >= threshold (default 70)."""
-    ctx = get_context()
+    ctx = get_customer_context()
     devices = [d for d in get_devices() if d["risk_score"] >= threshold]
     devices.sort(key=lambda x: x["risk_score"], reverse=True)
     
@@ -326,7 +379,7 @@ def get_high_risk_devices(threshold: int = 70) -> dict:
 @mcp.tool()
 def get_network_summary() -> dict:
     """Get network inventory and security summary."""
-    ctx = get_context()
+    ctx = get_customer_context()
     devices = get_devices()
     alerts = get_alerts()
     
@@ -353,6 +406,7 @@ def get_network_summary() -> dict:
     
     return {
         "customer": ctx["customer_name"],
+        "user": ctx["user_email"],
         "summary": {
             "total_devices": len(devices),
             "device_types": device_types,
@@ -368,14 +422,53 @@ def get_network_summary() -> dict:
 
 @mcp.tool()
 def whoami() -> dict:
-    """Show current user and customer context (useful for testing)."""
-    ctx = get_context()
+    """Show current user and customer context."""
+    ctx = get_customer_context()
     return {
+        "user_email": ctx["user_email"],
+        "customer_id": ctx["customer_id"],
         "customer_name": ctx["customer_name"],
         "data_set": ctx["data_set"],
         "test_mode": TEST_MODE,
-        "auth_service_url": AUTH_SERVICE_URL,
-        "message": f"Currently serving {ctx['customer_name']}'s data (tenant-a)"
+        "auth_service": AUTH_SERVICE_URL,
+        "message": f"You are {ctx['user_email']} accessing {ctx['customer_name']}'s data"
+    }
+
+
+@mcp.tool()
+def switch_customer(customer: str) -> dict:
+    """
+    Switch to a different customer dataset (for testing multi-tenant).
+    
+    Args:
+        customer: Either "a" or "b" (or "healthcare" / "manufacturing")
+    """
+    customer_lower = customer.lower()
+    
+    if customer_lower in ["a", "healthcare", "customer-a", "tenant-a"]:
+        new_ctx = {
+            "customer_name": "Healthcare Corp",
+            "data_set": "tenant-a",
+            "user_email": "test@healthcare.com",
+            "customer_id": "customer-a"
+        }
+    elif customer_lower in ["b", "manufacturing", "customer-b", "tenant-b"]:
+        new_ctx = {
+            "customer_name": "Manufacturing Inc",
+            "data_set": "tenant-b",
+            "user_email": "test@manufacturing.com",
+            "customer_id": "customer-b"
+        }
+    else:
+        return {"error": f"Unknown customer: {customer}. Use 'a' or 'b'"}
+    
+    current_customer.set(new_ctx)
+    
+    return {
+        "switched": True,
+        "now_serving": new_ctx["customer_name"],
+        "data_set": new_ctx["data_set"],
+        "message": f"Switched to {new_ctx['customer_name']}. Try 'list devices' to see their data."
     }
 
 
