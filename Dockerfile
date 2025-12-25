@@ -1,5 +1,5 @@
 # =============================================================================
-# Dockerfile for Ordr MCP Server
+# Dockerfile for Ordr MCP Server with Authentication
 # =============================================================================
 
 FROM python:3.11-slim
@@ -14,12 +14,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY mcp_server.py .
 
-# Environment variables (can be overridden at runtime)
+# Environment variables
 ENV MCP_PORT=8000
-ENV TENANT_ID=default
-ENV X_TENANT_ID=tenant-a
-ENV X_USER_EMAIL=test@example.com
-ENV X_USER_OID=test-oid
+ENV AZURE_CLIENT_ID=d63e5ccd-bd26-4b10-91b7-2dd7052577cb
+ENV TEST_MODE=false
 
 # Expose port
 EXPOSE 8000
