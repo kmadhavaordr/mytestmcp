@@ -1,25 +1,31 @@
 """
-Ordr MCP Server - With Auth Service Integration
+Ordr MCP Server - With Auth Wrapper
 
-This MCP server:
-1. Receives requests from Copilot Studio (with JWT token)
-2. Calls Auth service to validate token and get customer info
-3. Returns customer-specific data
+Architecture:
+1. FastAPI receives request on main port
+2. Extracts JWT token from Authorization header
+3. Calls Auth service to validate token
+4. If valid, forwards request to internal FastMCP with customer context
+5. Returns response to client
 
 Environment Variables:
-- PORT: Port to run on (default: 8000)
-- AUTH_SERVICE_URL: URL of auth validator service
-- TEST_MODE: "true" to use default customer when auth fails
+- PORT: External port (default: 8000)
+- AUTH_SERVICE_URL: Auth validator URL
+- TEST_MODE: "true" to allow requests without valid token
 """
 
 import os
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
-from contextvars import ContextVar
+from threading import Thread
 
 import httpx
-from fastmcp import FastMCP, Context
+import uvicorn
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastmcp import FastMCP
 
 # Configure logging
 logging.basicConfig(
@@ -32,62 +38,28 @@ logger = logging.getLogger("ordr-mcp")
 # CONFIGURATION
 # =============================================================================
 
+EXTERNAL_PORT = int(os.environ.get("PORT", 8000))
+INTERNAL_MCP_PORT = 8001  # FastMCP runs here internally
 AUTH_SERVICE_URL = os.environ.get("AUTH_SERVICE_URL", "https://mytestauth.onrender.com")
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 
-# Context variable to store customer info per-request
-current_customer: ContextVar[dict] = ContextVar('current_customer', default=None)
+# Customer context - set by auth, read by tools
+_customer_context = {}
 
-# Defaults
-DEFAULT_DATA_SET = "tenant-a"
-DEFAULT_CUSTOMER_NAME = "Healthcare Corp"
-DEFAULT_USER_EMAIL = "default@example.com"
+def set_customer_context(ctx: dict):
+    global _customer_context
+    _customer_context = ctx
+    logger.info(f"Customer context set: {ctx.get('customer_name')} / {ctx.get('user_email')}")
 
-# =============================================================================
-# AUTH SERVICE CLIENT
-# =============================================================================
-
-async def validate_with_auth_service(token: str) -> dict:
-    """
-    Call auth service to validate token.
-    
-    Returns: {"customer_name", "data_set", "user_email"}
-    Raises: Exception if validation fails
-    """
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            response = await client.get(
-                f"{AUTH_SERVICE_URL}/auth",
-                headers={"Authorization": f"Bearer {token}"}
-            )
-            
-            if response.status_code == 401:
-                raise ValueError("Invalid or expired token")
-            if response.status_code == 403:
-                raise ValueError("User not authorized")
-            if response.status_code != 200:
-                raise ValueError(f"Auth error: {response.status_code}")
-            
-            # Get customer info from response headers
-            return {
-                "customer_name": response.headers.get("X-Customer-Name", "Unknown"),
-                "data_set": response.headers.get("X-Data-Set", "tenant-a"),
-                "user_email": response.headers.get("X-User-Email", "unknown"),
-                "customer_id": response.headers.get("X-Customer-Id", "unknown"),
-            }
-        except httpx.RequestError as e:
-            raise ValueError(f"Auth service unreachable: {e}")
-
-
-def get_default_customer() -> dict:
-    """Return default customer for TEST_MODE."""
+def get_customer_context() -> dict:
+    if _customer_context:
+        return _customer_context
     return {
-        "customer_name": DEFAULT_CUSTOMER_NAME,
-        "data_set": DEFAULT_DATA_SET,
-        "user_email": DEFAULT_USER_EMAIL,
+        "customer_name": "Healthcare Corp (Default)",
+        "data_set": "tenant-a",
+        "user_email": "default@example.com",
         "customer_id": "default"
     }
-
 
 # =============================================================================
 # MOCK DATA
@@ -227,27 +199,16 @@ MOCK_ALERTS = {
     ]
 }
 
-
-def get_customer_context() -> dict:
-    """Get current customer context, or default if not set."""
-    ctx = current_customer.get()
-    if ctx:
-        return ctx
-    return get_default_customer()
-
-
 def get_devices() -> list:
     ctx = get_customer_context()
     return MOCK_DEVICES.get(ctx["data_set"], [])
-
 
 def get_alerts() -> list:
     ctx = get_customer_context()
     return MOCK_ALERTS.get(ctx["data_set"], [])
 
-
 # =============================================================================
-# FASTMCP SERVER
+# FASTMCP SERVER (runs internally)
 # =============================================================================
 
 mcp = FastMCP(
@@ -255,21 +216,8 @@ mcp = FastMCP(
     instructions="""
     You are the Ordr Security Assistant. You help users query their organization's
     device inventory, security alerts, and network information.
-    
-    Available tools:
-    - list_devices: List all devices with optional filters
-    - get_device_by_ip: Look up device by IP address
-    - get_device_by_hostname: Look up device by hostname
-    - list_alerts: List security alerts with optional filters
-    - get_high_risk_devices: Get devices with high risk scores
-    - get_network_summary: Get overall network security summary
-    - whoami: Show current user and customer context
     """
 )
-
-# =============================================================================
-# MCP TOOLS
-# =============================================================================
 
 @mcp.tool()
 def list_devices(
@@ -429,58 +377,151 @@ def whoami() -> dict:
         "customer_id": ctx["customer_id"],
         "customer_name": ctx["customer_name"],
         "data_set": ctx["data_set"],
-        "test_mode": TEST_MODE,
-        "auth_service": AUTH_SERVICE_URL,
-        "message": f"You are {ctx['user_email']} accessing {ctx['customer_name']}'s data"
+        "auth_validated": ctx.get("auth_validated", False),
+        "message": f"You are {ctx['user_email']} from {ctx['customer_name']}"
     }
 
 
-@mcp.tool()
-def switch_customer(customer: str) -> dict:
-    """
-    Switch to a different customer dataset (for testing multi-tenant).
-    
-    Args:
-        customer: Either "a" or "b" (or "healthcare" / "manufacturing")
-    """
-    customer_lower = customer.lower()
-    
-    if customer_lower in ["a", "healthcare", "customer-a", "tenant-a"]:
-        new_ctx = {
-            "customer_name": "Healthcare Corp",
-            "data_set": "tenant-a",
-            "user_email": "test@healthcare.com",
-            "customer_id": "customer-a"
-        }
-    elif customer_lower in ["b", "manufacturing", "customer-b", "tenant-b"]:
-        new_ctx = {
-            "customer_name": "Manufacturing Inc",
-            "data_set": "tenant-b",
-            "user_email": "test@manufacturing.com",
-            "customer_id": "customer-b"
-        }
-    else:
-        return {"error": f"Unknown customer: {customer}. Use 'a' or 'b'"}
-    
-    current_customer.set(new_ctx)
-    
+# =============================================================================
+# FASTAPI WRAPPER (handles auth, proxies to FastMCP)
+# =============================================================================
+
+app = FastAPI(title="Ordr MCP Gateway")
+
+@app.get("/health")
+def health():
     return {
-        "switched": True,
-        "now_serving": new_ctx["customer_name"],
-        "data_set": new_ctx["data_set"],
-        "message": f"Switched to {new_ctx['customer_name']}. Try 'list devices' to see their data."
+        "status": "healthy",
+        "service": "ordr-mcp-gateway",
+        "auth_service": AUTH_SERVICE_URL,
+        "test_mode": TEST_MODE,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
 
+async def validate_token(authorization: str) -> dict:
+    """Call auth service to validate token."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.get(
+                f"{AUTH_SERVICE_URL}/auth",
+                headers={"Authorization": authorization}
+            )
+            
+            if response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Invalid or expired token")
+            if response.status_code == 403:
+                raise HTTPException(status_code=403, detail="User not authorized")
+            if response.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Auth service error: {response.status_code}")
+            
+            return {
+                "customer_name": response.headers.get("X-Customer-Name", "Unknown"),
+                "data_set": response.headers.get("X-Data-Set", "tenant-a"),
+                "user_email": response.headers.get("X-User-Email", "unknown"),
+                "customer_id": response.headers.get("X-Customer-Id", "unknown"),
+                "auth_validated": True
+            }
+        except httpx.RequestError as e:
+            logger.error(f"Auth service error: {e}")
+            raise HTTPException(status_code=502, detail=f"Auth service unreachable")
+
+
+@app.api_route("/mcp/{path:path}", methods=["GET", "POST", "DELETE"])
+async def mcp_proxy(request: Request, path: str = ""):
+    """
+    Auth gateway for MCP requests.
+    1. Validate token with auth service
+    2. Set customer context
+    3. Forward to internal FastMCP
+    """
+    # Get authorization header
+    authorization = request.headers.get("Authorization", "")
+    
+    # Validate with auth service
+    if authorization:
+        try:
+            customer_ctx = await validate_token(authorization)
+            set_customer_context(customer_ctx)
+            logger.info(f"✅ Auth OK: {customer_ctx['user_email']} → {customer_ctx['customer_name']}")
+        except HTTPException as e:
+            if TEST_MODE:
+                logger.warning(f"⚠️ Auth failed but TEST_MODE enabled: {e.detail}")
+                set_customer_context({
+                    "customer_name": "Healthcare Corp (TEST_MODE)",
+                    "data_set": "tenant-a",
+                    "user_email": "test@example.com",
+                    "customer_id": "test",
+                    "auth_validated": False
+                })
+            else:
+                raise e
+    elif TEST_MODE:
+        logger.warning("⚠️ No auth header, using TEST_MODE defaults")
+        set_customer_context({
+            "customer_name": "Healthcare Corp (TEST_MODE)",
+            "data_set": "tenant-a",
+            "user_email": "test@example.com",
+            "customer_id": "test",
+            "auth_validated": False
+        })
+    else:
+        raise HTTPException(status_code=401, detail="No Authorization header")
+    
+    # Forward to internal FastMCP
+    mcp_url = f"http://127.0.0.1:{INTERNAL_MCP_PORT}/mcp/{path}"
+    
+    body = await request.body()
+    
+    # Build headers (pass through most headers)
+    forward_headers = {}
+    for key, value in request.headers.items():
+        if key.lower() not in ["host", "content-length"]:
+            forward_headers[key] = value
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.request(
+                method=request.method,
+                url=mcp_url,
+                headers=forward_headers,
+                content=body,
+            )
+            
+            # Return response
+            return StreamingResponse(
+                content=response.iter_bytes(),
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.headers.get("content-type")
+            )
+        except httpx.RequestError as e:
+            logger.error(f"MCP forward error: {e}")
+            raise HTTPException(status_code=502, detail="MCP service error")
+
+
 # =============================================================================
-# MAIN
+# STARTUP - Run both FastMCP and FastAPI
 # =============================================================================
+
+def run_fastmcp():
+    """Run FastMCP on internal port."""
+    logger.info(f"Starting internal FastMCP on port {INTERNAL_MCP_PORT}")
+    mcp.run(transport="streamable-http", host="127.0.0.1", port=INTERNAL_MCP_PORT)
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    # Start FastMCP in background thread
+    mcp_thread = Thread(target=run_fastmcp, daemon=True)
+    mcp_thread.start()
     
-    logger.info(f"Starting Ordr MCP Server on port {port}")
+    # Give FastMCP time to start
+    import time
+    time.sleep(2)
+    
+    # Start FastAPI on external port
+    logger.info(f"Starting FastAPI gateway on port {EXTERNAL_PORT}")
     logger.info(f"Auth Service: {AUTH_SERVICE_URL}")
     logger.info(f"Test Mode: {TEST_MODE}")
     
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=EXTERNAL_PORT)
